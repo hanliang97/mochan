@@ -84,9 +84,10 @@ private:
 
   // ---- State machine ----
   // 0 = deep sleep, 1 = tail wag, 2 = walking, 3 = heart
+  // Cycle: sleep 30s (25s deep + 5s wag) + awake 10s (7s walk + 3s heart)
   int catState = 0;
   unsigned long stateTimer = 0;
-  unsigned long stateDuration = 3000;
+  unsigned long stateDuration = 25000;
 
   // ---- Position (tweened: renderX eases toward walkX) ----
   float walkX   = 58.0f;
@@ -112,17 +113,14 @@ private:
   // =====================================================================
   void tick() {
     // ---- State transitions (millis-based, frame-rate independent) ----
+    // Deterministic cycle: sleep 30s (25s deep + 5s wag) + awake 10s (7s walk + 3s heart)
     if (millis() - stateTimer > stateDuration) {
       stateTimer = millis();
       switch (catState) {
-        case 0:                                   // deep sleep
-          if (random(10) < 3) { catState = 1; stateDuration = 800; }
-          else if (random(10) < 6) { catState = 2; stateDuration = 10000; walkDir = random(2) ? 1 : -1; }
-          else { catState = 0; stateDuration = random(2000, 4000); }
-          break;
-        case 1:  catState = 0; stateDuration = random(2000, 4000); break;
-        case 2:  catState = 3; stateDuration = 2000; break;
-        case 3:  catState = 0; stateDuration = random(3000, 5000); break;
+        case 0:  catState = 1; stateDuration = 5000;  break;            // deep sleep -> tail wag
+        case 1:  catState = 2; stateDuration = 7000;  walkDir = random(2) ? 1 : -1; break;  // wag -> walking
+        case 2:  catState = 3; stateDuration = 3000;  break;            // walking -> heart
+        case 3:  catState = 0; stateDuration = 25000; break;            // heart -> deep sleep
       }
     }
 
@@ -270,9 +268,11 @@ private:
 
   // =====================================================================
   //  Heart — pulse ~1.7 Hz, shown when state == 3
+  //  Drawn at the horizontal center of the cat's body (body is 14 wide,
+  //  so center is bx+7), not the left edge.
   // =====================================================================
   void drawHeart(int bx) {
-    int hx = bx, hy = 35;
+    int hx = bx + 7, hy = 35;
     display->fillCircle(hx - 2, hy, 2, C_WHITE);
     display->fillCircle(hx + 2, hy, 2, C_WHITE);
     display->fillTriangle(hx - 4, hy, hx + 4, hy, hx, hy + 5, C_WHITE);

@@ -72,10 +72,8 @@ void loadConfig() {
   if (f && f.size() == sizeof(cfg)) {
     f.read((uint8_t*)&cfg, sizeof(cfg));
     f.close();
-    Serial.println("Config loaded");
   } else {
     if (f) f.close();
-    Serial.println("Config: using defaults");
   }
 }
 void saveConfig() {
@@ -83,7 +81,6 @@ void saveConfig() {
   if (f) {
     f.write((const uint8_t*)&cfg, sizeof(cfg));
     f.close();
-    Serial.println("Config saved");
   }
 }
 
@@ -110,12 +107,10 @@ void weatherTask(void *param) {
   while (WiFi.status() != WL_CONNECTED) {
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
-  Serial.println("Weather task: WiFi ready");
 
   // 关键：WiFi 连上后先让出 10 秒，等主 loop 完成 setupServer() + 首次 HTTP 请求
   // 否则 TLS 握手会占满 CPU，主 loop 没机会启动 web server
   vTaskDelay(pdMS_TO_TICKS(10000));
-  Serial.println("Weather task: delayed start (let server start first)");
 
   while (true) {
     // 不再设置 wifiBusy —— 主 loop 不被阻塞，OLED 正常刷帧
@@ -129,7 +124,6 @@ void weatherTask(void *param) {
     snprintf(url, sizeof(url),
              "https://api.open-meteo.com/v1/forecast?latitude=%.2f&longitude=%.2f&current_weather=true&daily=sunrise,sunset&timezone=Asia/Shanghai",
              (double)LAT, (double)LON);
-    Serial.println("Weather sync (https)...");
     http.begin(client, url);
     http.setTimeout(5000);  // 5 秒超时
     int code = http.GET();
@@ -147,8 +141,6 @@ void weatherTask(void *param) {
           codeStr.trim();
           weatherCode = codeStr.toInt();
           weatherReady = true;
-          Serial.print("Weather code: ");
-          Serial.println(weatherCode);
         }
       }
       // 日出日落："sunrise":["2025-xx-xxT06:00","..."],"sunset":["2025-xx-xxT18:00","..."]
@@ -160,7 +152,6 @@ void weatherTask(void *param) {
           struct tm tm = {0};
           strptime(resp.substring(s, e).c_str(), "%Y-%m-%dT%H:%M", &tm);
           sunriseTime = mktime(&tm) - 8 * 3600;  // mktime 按本地时区算，转 UTC
-          Serial.print("Sunrise: "); Serial.println(resp.substring(s, e));
         }
       }
       int ssIdx = resp.indexOf("\"sunset\":[\"");
@@ -171,12 +162,8 @@ void weatherTask(void *param) {
           struct tm tm = {0};
           strptime(resp.substring(s, e).c_str(), "%Y-%m-%dT%H:%M", &tm);
           sunsetTime = mktime(&tm) - 8 * 3600;
-          Serial.print("Sunset: "); Serial.println(resp.substring(s, e));
         }
       }
-    } else {
-      Serial.print("Weather HTTP fail: ");
-      Serial.println(code);
     }
     http.end();
 
@@ -769,7 +756,6 @@ void handleUploadFile() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
     uploadFile = SPIFFS.open("/bg.dat", "w");
-    Serial.println("Upload start");
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (uploadFile) {
       uploadFile.write(upload.buf, upload.currentSize);
@@ -777,8 +763,6 @@ void handleUploadFile() {
   } else if (upload.status == UPLOAD_FILE_END) {
     if (uploadFile) {
       uploadFile.close();
-      Serial.print("Upload done, size=");
-      Serial.println(upload.totalSize);
     }
   }
 }
@@ -786,7 +770,6 @@ void handleUploadFile() {
 void handleDelBg() {
   if (SPIFFS.exists("/bg.dat")) {
     SPIFFS.remove("/bg.dat");
-    Serial.println("Background deleted");
   }
   server.send(200, "text/plain", "OK");
 }
@@ -795,7 +778,6 @@ void setupServer() {
   server.on("/", handleRoot);
   // 诊断端点：返回当前状态，便于排查
   server.on("/ping", [](){
-    Serial.println("[HTTP] /ping");
     server.send(200, "text/plain", "ok");
   });
   server.on("/f", [](){ manualActive=true; motorWifi(1); server.send(200); manualActive=false; });
@@ -858,8 +840,6 @@ void setup() {
   delay(3000);
   Serial.begin(115200);
   delay(50);
-  Serial.println("\n=== Mochan boot ===");
-  Serial.print("CPU freq: "); Serial.println(getCpuFrequencyMhz());
   // 不降频。ESP32-C3 在 80MHz 下 I2C 驱动分频配置不稳，
   // 会导致 SSD1306 初始化失败 → 黑屏。保持默认 160MHz。
   // 省电请通过 WiFi.setSleep(true) 或 lightsleep 实现，不要降 CPU 频率。
@@ -870,10 +850,7 @@ void setup() {
   pinMode(BOOT_BTN, INPUT_PULLUP);  // BOOT 键，按下=LOW
 
   // SPIFFS 初始化（存储背景图 + 配置）
-  if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS mount failed");
-  } else {
-    Serial.println("SPIFFS mounted");
+  if (SPIFFS.begin(true)) {
     loadConfig();
   }
 
@@ -883,9 +860,6 @@ void setup() {
     display.clearDisplay();
     display.display();
     oledAvailable = true;
-    Serial.println("OLED init OK");
-  } else {
-    Serial.println("OLED init FAIL");
   }
 
   // 12 fps：减少刷新频率，单帧幅度更大才看起来不卡
@@ -904,15 +878,12 @@ void setup() {
   // 不调 setTxPower，用默认最大功率 19.5dBm
   // 之前用 8.5dBm 最低档，TCP 包太大在弱信号下握手丢包
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.println("WiFi: async connect started");
 
   // 启动天气同步任务（独立 FreeRTOS 任务，5 小时一次）
   // 不再设置 wifiBusy，主 loop 自由刷屏
   xTaskCreate(weatherTask, "weather", 4096, NULL, 1, NULL);
-  Serial.println("Weather task started");
 
   digitalWrite(STBY, HIGH);
-  Serial.println("Setup done, entering loop");
 }
 
 /* ================= LOOP ================= */
@@ -924,13 +895,8 @@ void loop() {
   static bool lastBtn = true;
   bool btn = digitalRead(BOOT_BTN);
   if (lastBtn == true && btn == false) {  // 下降沿（按下）
-    Serial.println("BOOT pressed");
     if (WiFi.status() == WL_CONNECTED) {
       showIpUntil = millis() + 3000;
-      Serial.print("Show IP: ");
-      Serial.println(WiFi.localIP());
-    } else {
-      Serial.println("WiFi not connected, no IP");
     }
   }
   lastBtn = btn;
@@ -1050,11 +1016,8 @@ void loop() {
     if (!wifiServerStarted) {
       setupServer();
       wifiServerStarted = true;
-      Serial.print("WiFi connected! IP: ");
-      Serial.println(WiFi.localIP());
       // 首次连上时同步 NTP 时间（东八区）
       configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-      Serial.println("NTP time sync requested");
     }
     // 天气同步由独立任务处理，这里不调
     server.handleClient();
@@ -1063,7 +1026,6 @@ void loop() {
     if (wifiServerStarted) {
       wifiServerStarted = false;
       lastWifiAttempt = millis();  // 断线后从现在开始计时
-      Serial.println("WiFi lost, will retry in 10s");
     }
     // 每 10 秒尝试一次，最多等 5 秒
     if (!wifiAttempting) {
@@ -1073,14 +1035,12 @@ void loop() {
         wifiAttempting = true;
         WiFi.disconnect();
         WiFi.begin(WIFI_SSID, WIFI_PASS);
-        Serial.println("WiFi: retry connect (5s)...");
       }
     } else {
       // 正在尝试，5 秒内没连上就放弃
       if (millis() - wifiAttemptStart > 5000) {
         wifiAttempting = false;
         WiFi.disconnect();
-        Serial.println("WiFi: 5s timeout, give up, retry in 10s");
       }
     }
   }
