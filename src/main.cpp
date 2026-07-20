@@ -2,6 +2,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
+#include <ESPmDNS.h>
+#include <esp_system.h>          // esp_reset_reason() 检测 brownout
 #include <time.h>
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
@@ -30,13 +32,32 @@ RoboEyes<Adafruit_SSD1306> roboEyes(display);
 SleepingCat<Adafruit_SSD1306> sleepingCat(display);
 bool oledAvailable = false;
 
-/* ================= MOTOR PIN ================= */
+/* ================= MOTOR PIN + PWM 限流 ================= */
 #define LF   0
 #define LB   1
 #define RF   2
 #define RB   3
 #define STBY 10
 #define BOOT_BTN 9   // GPIO9 = BOOT 键
+
+// PWM 限流：LEDC 替代 digitalWrite，占空比限 MOTOR_DUTY/255
+// 限流原理：电机启动尖峰电流 ∝ 占空比
+// 140=55%（太慢）→ 200=78%（平衡点，电流降 22%，转速接近正常）
+// 如果还 brownout：改小（如 160≈63%）
+// 如果电机够快不 brownout：可以改 255=100%（不限流）
+#define MOTOR_PWM_FREQ   2000     // 2kHz：驱动器响应好，人耳听不到嗡嗡
+#define MOTOR_PWM_RES      8       // 8-bit 分辨率 (0-255)
+#define MOTOR_DUTY        200      // ~78%，电流降 22%，转速接近正常
+
+// LEDC 通道分配（0-7 低速通道，ESP32-C3 支持）
+#define LF_CH  0
+#define LB_CH  1
+#define RF_CH  2
+#define RB_CH  3
+
+// 辅助宏：HIGH = 限流占空比，LOW = 0
+#define M_ON(ch)   ledcWrite(ch, MOTOR_DUTY)
+#define M_OFF(ch)  ledcWrite(ch, 0)
 
 /* ================= WIFI (STA 模式) =================
  * 凭证在 src/secrets.h 里配置（拷贝 src/secrets.h.example 填自己的值，
@@ -90,6 +111,10 @@ volatile int weatherCode = 999;    // 999=未获取
 volatile bool weatherReady = false;
 volatile bool wifiBusy = false;    // WiFi 传输中，主 loop 检测到就暂停刷新
 
+// 模式 enum 必须在 weatherTask 之前定义（weatherTask 检查 randomMode 决定是否同步天气）
+enum RandomMode { RANDOM_OFF, RANDOM_SOFT, RANDOM_NORMAL };
+volatile RandomMode randomMode = RANDOM_OFF;  // 默认休眠模式
+
 // 日出日落（Unix epoch 秒，UTC）
 volatile time_t sunriseTime = 0;
 volatile time_t sunsetTime = 0;
@@ -108,24 +133,31 @@ void weatherTask(void *param) {
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
 
-  // 关键：WiFi 连上后先让出 10 秒，等主 loop 完成 setupServer() + 首次 HTTP 请求
-  // 否则 TLS 握手会占满 CPU，主 loop 没机会启动 web server
-  vTaskDelay(pdMS_TO_TICKS(10000));
+  // 关键：WiFi 连上后让出 60 秒，等用户先用 Web 控制台玩一会儿
+  // TLS 握手在 ESP32-C3 单核上会挤压主 loop 数秒，开机立刻跑会让 Web 卡死
+  vTaskDelay(pdMS_TO_TICKS(60000));
 
   while (true) {
+    // 只在休眠模式且没有背景图时同步天气：
+    //   摇摆/好奇模式 → 用 RoboEyes 大眼睛，天气画了也看不见，省 TLS 开销
+    //   有背景图      → 天空被背景图覆盖，天气画了也看不见
+    //   不符合条件就 60 秒后再检查，模式切回 OFF 立刻恢复同步
+    if (randomMode != RANDOM_OFF || SPIFFS.exists("/bg.dat")) {
+      vTaskDelay(pdMS_TO_TICKS(60000));
+      continue;
+    }
     // 不再设置 wifiBusy —— 主 loop 不被阻塞，OLED 正常刷帧
-    // open-meteo 只支持 HTTPS，TLS 握手在 ESP32-C3 单核上会挤压主 loop 数秒
-    // 但天气同步是低频操作（成功 2h 一次），可以接受
-    WiFiClientSecure client;
-    client.setInsecure();
+    // open-meteo 支持 HTTP（不强制 HTTPS），用 HTTP 省 TLS 握手
+    // 弱信号下 TLS 握手可能阻塞 5-10s，HTTP 只需 <1s，大幅减少对主 loop 的挤压
+    WiFiClient client;              // 普通 HTTP，不用 WiFiClientSecure
     HTTPClient http;
     // 加 daily=sunrise,sunset 拿日出日落时间
     char url[160];
     snprintf(url, sizeof(url),
-             "https://api.open-meteo.com/v1/forecast?latitude=%.2f&longitude=%.2f&current_weather=true&daily=sunrise,sunset&timezone=Asia/Shanghai",
+             "http://api.open-meteo.com/v1/forecast?latitude=%.2f&longitude=%.2f&current_weather=true&daily=sunrise,sunset&timezone=Asia/Shanghai",
              (double)LAT, (double)LON);
     http.begin(client, url);
-    http.setTimeout(5000);  // 5 秒超时
+    http.setTimeout(3000);  // 3 秒超时（HTTP 不需要 TLS 握手，够用）
     int code = http.GET();
     if (code == 200) {
       String resp = http.getString();
@@ -348,53 +380,113 @@ void drawWeatherIcon(int type, int x, int y) {
 volatile bool manualActive = false;
 unsigned long showIpUntil = 0;   // 按 BOOT 键显示 IP 的截止时间
 
-enum RandomMode { RANDOM_OFF, RANDOM_SOFT, RANDOM_NORMAL };
-volatile RandomMode randomMode = RANDOM_OFF;  // 默认休眠模式
+/* ================= 模式持久化（重启后恢复） =================
+ * 存 SPIFFS /mode.dat，1 字节。开机 loadMode() 读回，applyMode() 应用。
+ * 切换模式时自动保存，重启后还是上次的模式。
+ */
+void stopMotor();  // 前向声明（applyMode 在 stopMotor 定义之前）
 
+void loadMode() {
+  File f = SPIFFS.open("/mode.dat", "r");
+  if (f && f.size() == 1) {
+    uint8_t m = f.read();
+    f.close();
+    if (m <= (uint8_t)RANDOM_NORMAL) randomMode = (RandomMode)m;
+  } else {
+    if (f) f.close();
+  }
+}
+
+void saveMode() {
+  File f = SPIFFS.open("/mode.dat", "w");
+  if (f) {
+    f.write((uint8_t)randomMode);
+    f.close();
+  }
+}
+
+// 统一的模式切换入口：停旧电机 → 设新模式 → 初始化对应动画 → 持久化
+// Web 回调和开机恢复都走这里，避免逻辑重复
+void applyMode(RandomMode m) {
+  stopMotor();
+  randomMode = m;
+  if (m == RANDOM_OFF) {
+    oledAvailable = false;             // 休眠：关眼睛动画
+    display.clearDisplay();
+  } else {
+    oledAvailable = true;
+    roboEyes.setCuriosity(m == RANDOM_NORMAL);  // 好奇模式开 curiosity
+    roboEyes.setIdleMode(ON, 2, 2);
+    roboEyes.setMood(m == RANDOM_SOFT ? HAPPY : DEFAULT);
+    roboEyes.open();
+  }
+  saveMode();                          // 持久化，重启后恢复
+}
+
+/* ================= 错峰启动 =================
+ * N20 电机启动瞬间电流尖峰 1A+，稳态只要 200-300mA。
+ * 错峰：左右电机间隔 30ms 启动，双电机同时尖峰 → 单电机尖峰减半
+ * 把启动尖峰从 1A 降到 ~500mA，单节 3.7V 锂电池 + 升压模块就够用
+ * 不做软启动（delay 太久会让 Web 回调阻塞 → 看门狗触发 → 死机）
+ */
 /* ================= WIFI MOTOR ================= */
 void motorWifi(byte c) {
   digitalWrite(STBY, HIGH);
+  M_OFF(LF_CH); M_OFF(LB_CH); M_OFF(RF_CH); M_OFF(RB_CH);   // 先全停
   switch (c) {
-    case 0:
-      digitalWrite(LF,LOW); digitalWrite(LB,LOW);
-      digitalWrite(RF,LOW); digitalWrite(RB,LOW);
+    case 0:  // 停（已停）
       break;
-    case 1:
-      digitalWrite(LF,HIGH); digitalWrite(LB,LOW);
-      digitalWrite(RF,LOW);  digitalWrite(RB,HIGH);
+    case 1:  // 前进：左电机先启动，30ms 后右电机（错峰降尖峰）
+      M_OFF(LB_CH); M_OFF(RF_CH);
+      M_ON(LF_CH);  delay(30);  M_ON(RB_CH);
       break;
-    case 2:
-      digitalWrite(LF,LOW);  digitalWrite(LB,HIGH);
-      digitalWrite(RF,HIGH); digitalWrite(RB,LOW);
+    case 2:  // 后退
+      M_OFF(LF_CH); M_OFF(RB_CH);
+      M_ON(LB_CH);  delay(30);  M_ON(RF_CH);
       break;
-    case 3:
-      digitalWrite(LF,LOW);  digitalWrite(LB,HIGH);
-      digitalWrite(RF,LOW);  digitalWrite(RB,HIGH);
+    case 3:  // 左转
+      M_OFF(LF_CH); M_OFF(RF_CH);
+      M_ON(LB_CH);  delay(30);  M_ON(RB_CH);
       break;
-    case 4:
-      digitalWrite(LF,HIGH); digitalWrite(LB,LOW);
-      digitalWrite(RF,HIGH); digitalWrite(RB,LOW);
+    case 4:  // 右转
+      M_OFF(LB_CH); M_OFF(RB_CH);
+      M_ON(LF_CH);  delay(30);  M_ON(RF_CH);
       break;
   }
 }
 
-/* ================= RANDOM MOTOR ================= */
+/* ================= RANDOM MOTOR =================
+ * motorAbort：模式切换/手动控制时设为 true，正在跑的 MOTOR 循环会
+ * 立即停电机并退出，避免新模式电机和旧模式残余动作叠加 → 启动电流尖峰
+ * → USB 供电不足 → brownout 重启。
+ */
+volatile bool motorAbort = false;
+
+void stopMotor() {
+  motorAbort = true;            // 中断正在跑的 MOTOR 循环
+  M_OFF(LF_CH); M_OFF(LB_CH); M_OFF(RF_CH); M_OFF(RB_CH);
+}
+
 void MOTOR(byte c,int t1,int t2,int Time){
+  motorAbort = false;            // 进入新动作，清中断标志
   for(int i=0;i<Time;i++){
+    if (motorAbort) {            // 被切换/手动中断，立即停
+      M_OFF(LF_CH); M_OFF(LB_CH); M_OFF(RF_CH); M_OFF(RB_CH);
+      return;
+    }
     switch (c) {
-      case 0: digitalWrite(LF,LOW); digitalWrite(LB,LOW); digitalWrite(RF,LOW); digitalWrite(RB,LOW); break;
-      case 1: digitalWrite(LF,LOW); digitalWrite(LB,HIGH);digitalWrite(RF,LOW); digitalWrite(RB,HIGH);break;
-      case 2: digitalWrite(LF,HIGH);digitalWrite(LB,LOW); digitalWrite(RF,HIGH);digitalWrite(RB,LOW); break;
-      case 3: digitalWrite(LF,LOW); digitalWrite(LB,HIGH);digitalWrite(RF,HIGH);digitalWrite(RB,LOW); break;
-      case 4: digitalWrite(LF,HIGH);digitalWrite(LB,LOW); digitalWrite(RF,LOW); digitalWrite(RB,HIGH);break;
-      case 5: digitalWrite(LF,LOW); digitalWrite(LB,HIGH);digitalWrite(RF,LOW); digitalWrite(RB,LOW); break;
-      case 6: digitalWrite(LF,LOW); digitalWrite(LB,LOW); digitalWrite(RF,LOW); digitalWrite(RB,HIGH);break;
-      case 7: digitalWrite(LF,HIGH);digitalWrite(LB,LOW); digitalWrite(RF,LOW); digitalWrite(RB,LOW); break;
-      case 8: digitalWrite(LF,LOW); digitalWrite(LB,LOW); digitalWrite(RF,HIGH);digitalWrite(RB,LOW); break;
+      case 0: M_OFF(LF_CH); M_OFF(LB_CH); M_OFF(RF_CH); M_OFF(RB_CH); break;
+      case 1: M_OFF(LF_CH); M_ON(LB_CH);  M_OFF(RF_CH); M_ON(RB_CH);  break;
+      case 2: M_ON(LF_CH);  M_OFF(LB_CH); M_ON(RF_CH);  M_OFF(RB_CH); break;
+      case 3: M_OFF(LF_CH); M_ON(LB_CH);  M_ON(RF_CH);  M_OFF(RB_CH); break;
+      case 4: M_ON(LF_CH);  M_OFF(LB_CH); M_OFF(RF_CH); M_ON(RB_CH);  break;
+      case 5: M_OFF(LF_CH); M_ON(LB_CH);  M_OFF(RF_CH); M_OFF(RB_CH); break;
+      case 6: M_OFF(LF_CH); M_OFF(LB_CH); M_OFF(RF_CH); M_ON(RB_CH);  break;
+      case 7: M_ON(LF_CH);  M_OFF(LB_CH); M_OFF(RF_CH); M_OFF(RB_CH); break;
+      case 8: M_OFF(LF_CH); M_OFF(LB_CH); M_ON(RF_CH);  M_OFF(RB_CH); break;
     }
     delay(t1);
-    digitalWrite(LF,LOW); digitalWrite(LB,LOW);
-    digitalWrite(RF,LOW); digitalWrite(RB,LOW);
+    M_OFF(LF_CH); M_OFF(LB_CH); M_OFF(RF_CH); M_OFF(RB_CH);
     delay(t2);
   }
 }
@@ -618,52 +710,21 @@ void drawSky() {
 
 /* ================= WEB UI ================= */
 void handleRoot() {
-  String page = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-body{margin:0;height:100vh;background:radial-gradient(circle at top,#0f2027,#000);color:#00ffe1;font-family:Arial;display:flex;align-items:center;justify-content:center;}
-.panel{width:260px;padding:20px;border-radius:18px;background:rgba(0,255,225,0.05);border:1px solid rgba(0,255,225,0.4);box-shadow:0 0 25px rgba(0,255,225,0.3);}
-h2{text-align:center;margin:0 0 14px;letter-spacing:2px;}
-.grid{display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:60px 60px 60px;gap:10px;}
-button{border:none;border-radius:12px;font-size:16px;font-weight:bold;background:linear-gradient(145deg,#0ff,#00b3a4);}
-.stop{background:linear-gradient(145deg,#ff5555,#aa0000);color:#fff;}
-.empty{background:none;}
-.mode{margin-top:12px;display:flex;gap:6px;}
-.mode button{flex:1;font-size:13px;opacity:0.6;}
-.mode button.active{opacity:1;background:linear-gradient(145deg,#00ff9c,#00c46a);box-shadow:0 0 12px rgba(0,255,180,0.8);}
-.footer{margin-top:14px;text-align:center;font-size:11px;opacity:0.6;letter-spacing:1px;}
-</style>
-</head>
-<body>
-<div class="panel">
-<h2>MOCHAN 摸铲</h2>
-<div class="grid">
-  <div class="empty"></div>
-  <button onclick="fetch('/f')">前进</button>
-  <div class="empty"></div>
-  <button onclick="fetch('/l')">左转</button>
-  <button class="stop" onclick="fetch('/s')">停止</button>
-  <button onclick="fetch('/r')">右转</button>
-  <div class="empty"></div>
-  <button onclick="fetch('/b')">后退</button>
-  <div class="empty"></div>
-</div>
-<div class="mode">
-  <button id="btn_sleep" class="active" onclick="setMode('off')">休眠</button>
-  <button id="btn_wiggle" onclick="setMode('soft')">摇摆</button>
-  <button id="btn_curious" onclick="setMode('normal')">好奇</button>
-</div>
-<div class="footer"><a href="/bg" style="color:#00ffe1">背景设置</a></div>
-</div>
+  // 零 CSS：纯浏览器默认组件，~500 字节，弱 WiFi 下秒开
+  String page = R"rawliteral(<!DOCTYPE html><meta charset=UTF-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>MOCHAN</title>
+<h2 align=center>MOCHAN 摸铲</h2>
+<p><button onclick=f('/f')>前进</button> <button onclick=f('/b')>后退</button></p>
+<p><button onclick=f('/l')>左转</button> <button onclick=f('/r')>右转</button> <button onclick=f('/s')>停止</button></p>
+<hr>
+<p><button id=b1 onclick=sm('off')>休眠</button> <button id=b2 onclick=sm('soft')>摇摆</button> <button id=b3 onclick=sm('normal')>好奇</button></p>
+<p><a href=/bg>背景设置</a></p>
 <script>
-function clearActive(){document.getElementById('btn_sleep').classList.remove('active');document.getElementById('btn_wiggle').classList.remove('active');document.getElementById('btn_curious').classList.remove('active');}
-function setMode(mode){fetch('/mode_'+mode);clearActive();if(mode==='off')document.getElementById('btn_sleep').classList.add('active');if(mode==='soft')document.getElementById('btn_wiggle').classList.add('active');if(mode==='normal')document.getElementById('btn_curious').classList.add('active');}
-</script>
-</body></html>)rawliteral";
+function f(u){fetch(u)}
+function sm(m){fetch('/mode_'+m);['b1','b2','b3'].forEach(i=>document.getElementById(i).style.fontWeight='normal');document.getElementById(m=='off'?'b1':m=='soft'?'b2':'b3').style.fontWeight='bold'}
+</script>)rawliteral";
+  // 浏览器缓存 1 天：首次打开慢，之后秒开
+  server.sendHeader("Cache-Control", "max-age=86400");
   server.send(200, "text/html; charset=utf-8", page);
 }
 
@@ -780,33 +841,21 @@ void setupServer() {
   server.on("/ping", [](){
     server.send(200, "text/plain", "ok");
   });
-  server.on("/f", [](){ manualActive=true; motorWifi(1); server.send(200); manualActive=false; });
-  server.on("/b", [](){ manualActive=true; motorWifi(2); server.send(200); manualActive=false; });
-  server.on("/l", [](){ manualActive=true; motorWifi(3); server.send(200); manualActive=false; });
-  server.on("/r", [](){ manualActive=true; motorWifi(4); server.send(200); manualActive=false; });
-  server.on("/s", [](){ manualActive=true; motorWifi(0); server.send(200); manualActive=false; });
+  server.on("/f", [](){ stopMotor(); manualActive=true; motorWifi(1); server.send(200); manualActive=false; });
+  server.on("/b", [](){ stopMotor(); manualActive=true; motorWifi(2); server.send(200); manualActive=false; });
+  server.on("/l", [](){ stopMotor(); manualActive=true; motorWifi(3); server.send(200); manualActive=false; });
+  server.on("/r", [](){ stopMotor(); manualActive=true; motorWifi(4); server.send(200); manualActive=false; });
+  server.on("/s", [](){ stopMotor(); manualActive=true; motorWifi(0); server.send(200); manualActive=false; });
   server.on("/mode_off",    [](){
-    randomMode = RANDOM_OFF;
-    oledAvailable = false;             // 休眠：关眼睛动画，loop 里改显示时间
-    display.clearDisplay();
+    applyMode(RANDOM_OFF);
     server.send(200);
   });
   server.on("/mode_soft",   [](){
-    randomMode = RANDOM_SOFT;
-    oledAvailable = true;              // 恢复眼睛
-    roboEyes.setCuriosity(false);
-    roboEyes.setIdleMode(ON, 2, 2);
-    roboEyes.setMood(HAPPY);
-    roboEyes.open();
+    applyMode(RANDOM_SOFT);
     server.send(200);
   });
   server.on("/mode_normal", [](){
-    randomMode = RANDOM_NORMAL;
-    oledAvailable = true;
-    roboEyes.setCuriosity(true);
-    roboEyes.setIdleMode(ON, 2, 2);
-    roboEyes.setMood(DEFAULT);
-    roboEyes.open();
+    applyMode(RANDOM_NORMAL);
     server.send(200);
   });
   server.onNotFound(handleRoot);
@@ -837,21 +886,34 @@ void setupServer() {
 
 /* ================= SETUP ================= */
 void setup() {
-  delay(3000);
-  Serial.begin(115200);
-  delay(50);
-  // 不降频。ESP32-C3 在 80MHz 下 I2C 驱动分频配置不稳，
-  // 会导致 SSD1306 初始化失败 → 黑屏。保持默认 160MHz。
-  // 省电请通过 WiFi.setSleep(true) 或 lightsleep 实现，不要降 CPU 频率。
+  delay(500);                      // 3s→500ms：不插 USB 时不需要等 CDC 枚举
+  Serial.begin(115200);            // 保留：插 USB 时还能看串口，不插时无开销
+
+  // 检测上次复位原因：brownout = 供电不足（电机启动电流尖峰拖垮电源）
+  // 这种情况下强制休眠模式，不开电机，打破"重启 → 跑电机 → brownout → 重启"死循环
+  bool wasBrownout = (esp_reset_reason() == ESP_RST_BROWNOUT);
 
   pinMode(STBY,OUTPUT); digitalWrite(STBY,LOW);
-  pinMode(LF,OUTPUT); pinMode(LB,OUTPUT);
-  pinMode(RF,OUTPUT); pinMode(RB,OUTPUT);
   pinMode(BOOT_BTN, INPUT_PULLUP);  // BOOT 键，按下=LOW
 
-  // SPIFFS 初始化（存储背景图 + 配置）
+  // 电机 PWM 限流初始化：4 个引脚配 LEDC 通道，占空比限 MOTOR_DUTY
+  // 用 ledcSetup + ledcAttachPin + ledcWrite 替代 digitalWrite
+  ledcSetup(LF_CH, MOTOR_PWM_FREQ, MOTOR_PWM_RES); ledcAttachPin(LF, LF_CH);
+  ledcSetup(LB_CH, MOTOR_PWM_FREQ, MOTOR_PWM_RES); ledcAttachPin(LB, LB_CH);
+  ledcSetup(RF_CH, MOTOR_PWM_FREQ, MOTOR_PWM_RES); ledcAttachPin(RF, RF_CH);
+  ledcSetup(RB_CH, MOTOR_PWM_FREQ, MOTOR_PWM_RES); ledcAttachPin(RB, RB_CH);
+  M_OFF(LF_CH); M_OFF(LB_CH); M_OFF(RF_CH); M_OFF(RB_CH);   // 初始全停
+
+  // SPIFFS 初始化（存储背景图 + 配置 + 模式）
   if (SPIFFS.begin(true)) {
     loadConfig();
+    loadMode();                        // 读取上次的模式（重启恢复）
+  }
+
+  // brownout 重启：强制休眠模式，清掉保存的电机模式，避免又一轮重启循环
+  if (wasBrownout) {
+    randomMode = RANDOM_OFF;
+    saveMode();                        // 持久化为 OFF
   }
 
   // 频率直接传给 Wire.begin，避免 v3 setClock() 不生效的 bug
@@ -862,21 +924,49 @@ void setup() {
     oledAvailable = true;
   }
 
+  // brownout 提示：让用户知道为什么模式被重置了
+  if (wasBrownout && oledAvailable) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 10);
+    display.println("供电不足(brownout)");
+    display.setCursor(0, 25);
+    display.println("已切到休眠模式");
+    display.setCursor(0, 40);
+    display.println("检查电源/充电宝");
+    display.display();
+    delay(4000);
+    display.clearDisplay();
+  }
+
   // 12 fps：减少刷新频率，单帧幅度更大才看起来不卡
   roboEyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 12);
   roboEyes.setAutoblinker(ON, 3, 2);
   roboEyes.setIdleMode(ON, 2, 2);
   roboEyes.setMood(DEFAULT);
 
+  // 恢复上次模式（仅非 brownout 重启才恢复电机模式）
+  // 必须在 roboEyes.begin() 之后调，否则眼睛动画没初始化
+  if (randomMode != RANDOM_OFF) {
+    applyMode(randomMode);             // 重启前是摇摆/好奇，重启后还是
+  }
+
   // 小猫动画引擎：跟 RoboEyes 同样的 begin()/update() 用法
   // 10 fps + 指数缓动，走路/尾巴/呼吸全部丝滑
-  sleepingCat.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 10);
+  // 小猫动画引擎：8 fps（从 10 降，减少 I2C 阻塞给 Web 让 CPU）
+  sleepingCat.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 8);
   sleepingCat.setBackgroundCallback(drawSky);  // 天空/天气/月相仍由 main.cpp 画
 
-  // WiFi：异步连接，不阻塞 setup
+  // WiFi：异步连接（不阻塞 setup，主 loop 自然轮询）
+  // ESP32-C3 在 esptool 硬复位后 WiFi 射频状态可能没清干净，
+  // 必须显式 persistent(false) + disconnect(eraseAP) 清掉 NVS 残留凭据，
+  // 否则会"必须拔插 USB 才连得上"。
+  WiFi.persistent(false);            // 不写 NVS，避免凭据残留
   WiFi.mode(WIFI_STA);
-  // 不调 setTxPower，用默认最大功率 19.5dBm
-  // 之前用 8.5dBm 最低档，TCP 包太大在弱信号下握手丢包
+  WiFi.disconnect(true, true);       // 清掉 NVS 里任何残留的 AP 配置
+  WiFi.setSleep(false);              // 关 WiFi 省电 → 显著降低 Web 请求延迟
+  WiFi.setAutoReconnect(true);       // 断线后库自动重连
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   // 启动天气同步任务（独立 FreeRTOS 任务，5 小时一次）
@@ -1006,42 +1096,33 @@ void loop() {
     }
   }
 
-  // 后台 WiFi 管理：未连接时每 10 秒尝试一次，5 秒内连不上就放弃
-  static unsigned long lastWifiAttempt = 0;
+  // 后台 WiFi 管理：setAutoReconnect(true) 已经会自动重连，这里是兜底
+  // 如果 60s 还没连上（或断线后 60s 没自动重连），手动重试一次
+  static unsigned long lastWifiAttempt = millis();   // 首次启动给足时间，不立即重试
   static bool wifiServerStarted = false;
-  static unsigned long wifiAttemptStart = 0;
-  static bool wifiAttempting = false;
 
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiServerStarted) {
       setupServer();
       wifiServerStarted = true;
+      // 启动 mDNS：之后浏览器直接访问 http://mochan.local，不用记 IP
+      MDNS.begin("mochan");
+      MDNS.addService("http", "tcp", 80);
       // 首次连上时同步 NTP 时间（东八区）
       configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
     }
     // 天气同步由独立任务处理，这里不调
     server.handleClient();
   } else {
-    // 断线后重置 server 状态
+    // 断线后重置 server 状态，重新计时
     if (wifiServerStarted) {
       wifiServerStarted = false;
-      lastWifiAttempt = millis();  // 断线后从现在开始计时
+      lastWifiAttempt = millis();
     }
-    // 每 10 秒尝试一次，最多等 5 秒
-    if (!wifiAttempting) {
-      if (millis() - lastWifiAttempt > 10000) {
-        lastWifiAttempt = millis();
-        wifiAttemptStart = millis();
-        wifiAttempting = true;
-        WiFi.disconnect();
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
-      }
-    } else {
-      // 正在尝试，5 秒内没连上就放弃
-      if (millis() - wifiAttemptStart > 5000) {
-        wifiAttempting = false;
-        WiFi.disconnect();
-      }
+    // 60s 没连上才手动重试，避免和 setAutoReconnect 抢着 disconnect
+    if (millis() - lastWifiAttempt > 60000) {
+      lastWifiAttempt = millis();
+      WiFi.reconnect();   // 比 disconnect+begin 温和，不打断库的内部状态
     }
   }
 
@@ -1057,10 +1138,11 @@ void loop() {
     }
     else if (randomMode == RANDOM_NORMAL) {
       // 好奇：左右走动（前进 case 2 + 左转 case 3 + 右转 case 4 混合）
+      // 单次最多 3 个 tick（原来 random(20) 能阻塞近 3s，电机尖峰密集 → brownout）
       if (random(100) == 1) {
         byte dirs[] = {2, 3, 4};
         byte dir = dirs[random(3)];
-        MOTOR(dir, random(5,50), random(10,100), random(20));
+        MOTOR(dir, random(5,30), random(10,50), random(1, 4));  // 1-3 次循环
       }
     }
   }
