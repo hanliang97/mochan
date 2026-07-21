@@ -52,6 +52,10 @@ public:
 
   void setBackgroundCallback(void (*cb)(void)) { drawBackground = cb; }
 
+  // 坏天气/夜晚时猫躲进房子里睡觉，不出来活动
+  // main.cpp 根据天气+时间调用
+  void setHideInHouse(bool h) { hideInHouse = h; }
+
   void setOverlay(bool t, bool w, bool u) {
     overlayTime = t;
     overlayWeekday = w;
@@ -89,6 +93,9 @@ private:
   unsigned long stateTimer = 0;
   unsigned long stateDuration = 25000;
 
+  // ---- 坏天气/夜晚：猫躲房子里睡觉 ----
+  bool hideInHouse = false;
+
   // ---- Position (tweened: renderX eases toward walkX) ----
   float walkX   = 58.0f;
   float renderX = 58.0f;
@@ -112,6 +119,13 @@ private:
   //  tick — advance state machine + animation phases
   // =====================================================================
   void tick() {
+    // 坏天气/夜晚：猫在房子里睡觉，不跑状态机
+    if (hideInHouse) {
+      // 尾巴慢摆（在房子里睡觉）
+      tailPhase += 1.0f * frameInterval / 1000.0f;
+      return;
+    }
+
     // ---- State transitions (millis-based, frame-rate independent) ----
     // Deterministic cycle: sleep 30s (25s deep + 5s wag) + awake 10s (7s walk + 3s heart)
     if (millis() - stateTimer > stateDuration) {
@@ -146,29 +160,78 @@ private:
   }
 
   // =====================================================================
-  //  drawScene — clear, background, cat, overlay
+  //  drawScene — clear, background, house, cat, overlay
   // =====================================================================
   void drawScene() {
     display->clearDisplay();
     if (drawBackground) drawBackground();
 
-    bool awake = (catState == 2 || catState == 3);
-    int bx = (int)renderX;
-    int by = 48;
+    // 始终画右下角的小房子
+    drawHouse();
 
-    // Breathing: body Y oscillates ±1 px while sleeping / tail-wagging
-    if (catState == 0 || catState == 1) {
-      float s = sinf(millis() * 0.002f);
-      by += (s > 0.5f) ? 1 : (s < -0.5f) ? -1 : 0;
+    if (hideInHouse) {
+      // 坏天气/夜晚：猫在房子里睡觉，只画 zzz 从房子飘出
+      drawHouseZzz();
+    } else {
+      // 天气好白天：猫出来活动
+      bool awake = (catState == 2 || catState == 3);
+      int bx = (int)renderX;
+      int by = 48;
+
+      // Breathing: body Y oscillates ±1 px while sleeping / tail-wagging
+      if (catState == 0 || catState == 1) {
+        float s = sinf(millis() * 0.002f);
+        by += (s > 0.5f) ? 1 : (s < -0.5f) ? -1 : 0;
+      }
+
+      drawBody(awake, bx, by);
+      drawTail(bx, by);
+      if (awake) drawLegs(bx, by);
+      if (catState == 0 || catState == 1) drawZzz(bx);
+      if (catState == 3) drawHeart(bx);
     }
 
-    drawBody(awake, bx, by);
-    drawTail(bx, by);
-    if (awake) drawLegs(bx, by);
-    if (catState == 0 || catState == 1) drawZzz(bx);
-    if (catState == 3) drawHeart(bx);
-
     drawOverlay();
+  }
+
+  // =====================================================================
+  //  drawHouse — 右下角小房子（始终画）
+  //  位置：x=104-120, y=40-56（16 宽 16 高）
+  // =====================================================================
+  void drawHouse() {
+    int hx = 104, hy = 56;   // 房子左下角
+    // 屋顶（三角形）
+    display->fillTriangle(hx, hy - 12, hx + 8, hy - 18, hx + 16, hy - 12, C_WHITE);
+    // 墙（矩形）
+    display->fillRect(hx, hy - 12, 16, 12, C_WHITE);
+    // 门（黑色矩形挖洞）
+    display->fillRect(hx + 6, hy - 6, 4, 6, C_BLACK);
+    // 窗户（黑色方块）
+    display->fillRect(hx + 2, hy - 10, 3, 3, C_BLACK);
+  }
+
+  // =====================================================================
+  //  drawHouseZzz — 猫在房子里睡觉时 zzz 从窗户飘出
+  // =====================================================================
+  void drawHouseZzz() {
+    display->setTextSize(1);
+    display->setTextColor(C_WHITE);
+    int zPhase = (millis() / 100) % 25;
+    if (zPhase < 22) {
+      int zy = 36 - zPhase;     // 从房子窗户(y=36)向上飘
+      display->setCursor(108, zy);
+      display->print("z");
+      display->setCursor(113, zy - 4);
+      display->print("Z");
+    }
+
+    // 门里上下动的小点 = 模拟猫在房子里活动
+    // 门范围：x=110-113, y=50-55（黑色），白点在黑色门上可见
+    float bounce = sinf(millis() * 0.003f);   // -1..1
+    int doorX = 111 + (int)(bounce * 0.5f);   // 门中间 x，左右微动
+    int doorY = 52 + (int)(bounce * 1.5f);     // 门中间 y，上下动
+    display->drawPixel(doorX, doorY, C_WHITE);
+    display->drawPixel(doorX + 1, doorY, C_WHITE);
   }
 
   // =====================================================================

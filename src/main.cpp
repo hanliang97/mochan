@@ -4,7 +4,6 @@
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include <esp_system.h>          // esp_reset_reason() 检测 brownout
-#include <esp_wifi.h>           // esp_wifi_set_max_tx_power 降发射功率
 #include <time.h>
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
@@ -968,12 +967,6 @@ void setup() {
   WiFi.disconnect(true, true);       // 清掉 NVS 里任何残留的 AP 配置
   WiFi.setSleep(false);              // 关 WiFi 省电 → 显著降低 Web 请求延迟
   WiFi.setAutoReconnect(true);       // 断线后库自动重连
-  // 降发射功率到 8.5dBm（默认 19.5dBm）：
-  //   1. 射频峰值电流从 ~240mA 降到 ~120mA，电池供电时 brownout 概率大降
-  //   2. 板载 PCB 天线在高功率下信号失真/反射，反而握手失败；低功率信号更"干净"
-  //   3. 近距离（同房间路由器）8.5dBm 完全够用，远距离才需要高功率
-  // 路由器太远时可以改 WIFI_POWER_17dBm 或 WIFI_POWER_19_5dBm
-  esp_wifi_set_max_tx_power(WIFI_POWER_8_5dBm);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   // 启动天气同步任务（独立 FreeRTOS 任务，5 小时一次）
@@ -1098,6 +1091,18 @@ void loop() {
         else            snprintf(uptimeStr, sizeof(uptimeStr), "UP%dh", (int)(upMin / 60));
         sleepingCat.setOverlay(cfg.showTime, cfg.showWeekday, cfg.showUptime);
         sleepingCat.setTimeInfo(timeStr, weekdayStr, uptimeStr);
+
+        // 判断猫是否躲房子：坏天气(雨/雷/雪/雾) 或 夜间(21:00-05:00)
+        bool badWeather = (getWeatherType() >= 3);
+        bool sleepTime = false;
+        {
+          struct tm ti;
+          if (getLocalTime(&ti)) {
+            int h = ti.tm_hour;
+            sleepTime = (h >= 21 || h < 5);  // 晚上9点到早上5点
+          }
+        }
+        sleepingCat.setHideInHouse(badWeather || sleepTime);
       }
       sleepingCat.update();
     }
