@@ -199,10 +199,10 @@ void weatherTask(void *param) {
     }
     http.end();
 
-    // 成功 30 分钟同步一次（WiFi 在线才等）；失败 60 秒后重试
+    // 成功 20 分钟同步一次（WiFi 在线才等）；失败 60 秒后重试
     if (code == 200) {
-      // 30 分钟内每 10 秒检查 WiFi，断线就提前退出，等 WiFi 恢复再同步
-      for (int i = 0; i < 180 && WiFi.status() == WL_CONNECTED; i++) {
+      // 20 分钟内每 10 秒检查 WiFi，断线就提前退出，等 WiFi 恢复再同步
+      for (int i = 0; i < 120 && WiFi.status() == WL_CONNECTED; i++) {
         vTaskDelay(pdMS_TO_TICKS(10000));
       }
     } else {
@@ -713,19 +713,31 @@ void drawSky() {
 
 /* ================= WEB UI ================= */
 void handleRoot() {
-  // 零 CSS：纯浏览器默认组件，~500 字节，弱 WiFi 下秒开
-  String page = R"rawliteral(<!DOCTYPE html><meta charset=UTF-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>MOCHAN</title>
-<h2 align=center>MOCHAN 摸铲</h2>
-<p><button onclick=f('/f')>前进</button> <button onclick=f('/b')>后退</button></p>
-<p><button onclick=f('/l')>左转</button> <button onclick=f('/r')>右转</button> <button onclick=f('/s')>停止</button></p>
-<hr>
-<p><button id=b1 onclick=sm('off')>休眠</button> <button id=b2 onclick=sm('soft')>摇摆</button> <button id=b3 onclick=sm('normal')>好奇</button></p>
-<p><a href=/bg>背景设置</a></p>
+  // 参考原版 Mochan 的渐变面板 + 网格布局 + 发光按钮
+  // 供电问题已解决（升压模块），不用再极致精简，恢复漂亮 UI
+  String page = R"rawliteral(<!DOCTYPE html><html><head><meta charset=UTF-8><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{margin:0;height:100vh;background:radial-gradient(circle at top,#0f2027,#000);color:#0ff;font-family:Arial;display:flex;align-items:center;justify-content:center}
+.p{width:260px;padding:20px;border-radius:18px;background:rgba(0,255,225,0.05);border:1px solid rgba(0,255,225,0.4);box-shadow:0 0 25px rgba(0,255,225,0.3)}
+h2{text-align:center;margin:0 0 14px;letter-spacing:2px}
+.g{display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:60px 60px 60px;gap:10px}
+button{border:0;border-radius:12px;font-size:16px;font-weight:bold;background:linear-gradient(145deg,#0ff,#00b3a4);color:#000}
+.s{background:linear-gradient(145deg,#f55,#a00);color:#fff}
+.e{background:none}
+.m{margin-top:12px;display:flex;gap:6px}
+.m button{flex:1;font-size:13px;opacity:.5}
+.m .a{opacity:1;background:linear-gradient(145deg,#0fc,#0a6);box-shadow:0 0 12px rgba(0,255,180,0.8)}
+.f{margin-top:14px;text-align:center;font-size:11px;opacity:.6}
+a{color:#0ff}</style></head><body>
+<div class=p><h2>MOCHAN 摸铲</h2><div class=g>
+<div class=e></div><button onclick=f('/f')>前进</button><div class=e></div>
+<button onclick=f('/l')>左转</button><button class=s onclick=f('/s')>停止</button><button onclick=f('/r')>右转</button>
+<div class=e></div><button onclick=f('/b')>后退</button><div class=e></div>
+</div><div class=m><button id=b1 onclick=sm('off')>休眠</button><button id=b2 onclick=sm('soft')>摇摆</button><button id=b3 class=a onclick=sm('normal')>好奇</button></div>
+<div class=f><a href=/bg>背景设置</a></div></div>
 <script>
 function f(u){fetch(u)}
-function sm(m){fetch('/mode_'+m);['b1','b2','b3'].forEach(i=>document.getElementById(i).style.fontWeight='normal');document.getElementById(m=='off'?'b1':m=='soft'?'b2':'b3').style.fontWeight='bold'}
-</script>)rawliteral";
+function sm(m){fetch('/mode_'+m);['b1','b2','b3'].forEach(i=>document.getElementById(i).classList.remove('a'));document.getElementById(m=='off'?'b1':m=='soft'?'b2':'b3').classList.add('a')}
+</script></body></html>)rawliteral";
   // 浏览器缓存 1 天：首次打开慢，之后秒开
   server.sendHeader("Cache-Control", "max-age=86400");
   server.send(200, "text/html; charset=utf-8", page);
