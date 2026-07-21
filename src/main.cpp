@@ -199,9 +199,12 @@ void weatherTask(void *param) {
     }
     http.end();
 
-    // 成功 2 小时同步一次；失败 60 秒后重试
+    // 成功 30 分钟同步一次（WiFi 在线才等）；失败 60 秒后重试
     if (code == 200) {
-      vTaskDelay(pdMS_TO_TICKS(2 * 60 * 60 * 1000));
+      // 30 分钟内每 10 秒检查 WiFi，断线就提前退出，等 WiFi 恢复再同步
+      for (int i = 0; i < 180 && WiFi.status() == WL_CONNECTED; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+      }
     } else {
       vTaskDelay(pdMS_TO_TICKS(60 * 1000));
     }
